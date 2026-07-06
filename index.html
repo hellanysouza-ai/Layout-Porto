@@ -269,6 +269,14 @@ function similarity(a,b){
   const na=normalize(a), nb=normalize(b);
   if(na===nb) return 100;
   if(!na||!nb) return 0;
+  // O relatório da operadora costuma vir com o nome cortado (largura fixa da coluna,
+  // ex.: 40/50 caracteres). Quando o nome mais curto é claramente um prefixo do mais
+  // longo, trata como correspondência de alta confiança em vez de penalizar pelo corte.
+  const shorter = na.length<=nb.length ? na : nb;
+  const longer = na.length<=nb.length ? nb : na;
+  if(shorter.length>=15 && longer.startsWith(shorter)){
+    return 96;
+  }
   const dist=levenshtein(na,nb);
   const maxLen=Math.max(na.length,nb.length)||1;
   const levSim=(1-dist/maxLen)*100;
