@@ -155,7 +155,7 @@
         <div class="filelist" id="reportFileList"></div>
       </div>
       <div class="drop" id="dropBase">
-        <input type="file" id="fileBase" accept=".xml,.xlsx">
+        <input type="file" id="fileBase" accept=".xml,.xlsx,.xls">
         <div class="lbl">🗂️ Base Sis</div>
         <div class="sub">.xml (exportação do Sis)</div>
         <div class="filelist" id="baseFileList"></div>
@@ -198,6 +198,7 @@
         <span class="warn" id="exportWarn"></span>
         <button class="secondary" onclick="exportExcluidosXLSX()">⬇ Relatório de excluídos (.xlsx)</button>
         <button class="secondary" onclick="exportXLSX()">⬇ Exportar Layout Porto (.xlsx)</button>
+        <button class="secondary" onclick="exportCSV()">⬇ Exportar Layout Porto (.csv)</button>
         <button class="secondary" onclick="exportTXT()">⬇ Exportar TXT (SisWeb)</button>
       </div>
       <div class="footer-actions hidden" id="footerSimple">
@@ -213,7 +214,7 @@
 <script>
 // ============== STATE ==============
 let reportFiles = [];   // {name, text}
-let baseFile = null;    // {name, text}
+let baseFile = null;    // {name, buffer}
 let baseRecords = [];   // {proposta, corretor, segurado, modalidade, operadora}
 let allRows = [];       // parsed+matched rows
 let currentTab = 'comissao';
@@ -351,30 +352,61 @@ function parseReport(htmlText, sourceName){
   return rows;
 }
 
-// ============== PARSE BASE SIS (.xml SpreadsheetML) ==============
-function parseBaseSis(xmlText){
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const rowsEl = Array.from(doc.getElementsByTagName('Row'));
-  if(rowsEl.length===0) throw new Error('Nenhuma linha encontrada no XML.');
-  const getCells = (rowEl) => Array.from(rowEl.getElementsByTagName('Cell')).map(c=>{
-    const d = c.getElementsByTagName('Data')[0];
-    return d ? d.textContent : '';
+// ============== PARSE BASE SIS (.xml SpreadsheetML ou .xlsx) ==============
+// Lido via SheetJS: respeita células vazias omitidas no XML (ss:Index), então cada
+// valor cai na coluna certa. O cabeçalho é localizado pelo nome (sem diferenciar
+// maiúsculas/acentos), mesmo que haja linhas de título antes dele.
+function normHeader(s){
+  return String(s==null?'':s).normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+}
+function findCol(headers, names){
+  const hs = headers.map(normHeader);
+  for(const n of names){ const i = hs.indexOf(n); if(i!==-1) return i; }   // nome exato primeiro
+  for(const n of names){ const i = hs.findIndex(h=>h.startsWith(n)); if(i!==-1) return i; }
+  return -1;
+}
+function cellStr(v){
+  if(v===null || v===undefined) return '';
+  if(typeof v==='number') return Number.isInteger(v) ? String(v) : String(v);
+  return String(v).trim();
+}
+function parseBaseSis(buffer){
+  const wb = XLSX.read(new Uint8Array(buffer), {type:'array', raw:true});
+  let best = null;
+  wb.SheetNames.forEach(sn=>{
+    if(best) return;
+    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sn], {header:1, raw:true, defval:''});
+    for(let r=0; r<Math.min(aoa.length, 30); r++){
+      const hdr = aoa[r] || [];
+      const iSeg = findCol(hdr, ['segurado']);
+      const iProp = findCol(hdr, ['proposta']);
+      if(iSeg!==-1 && iProp!==-1){ best = {aoa, r, hdr, iSeg, iProp}; break; }
+    }
   });
-  const header = getCells(rowsEl[0]);
-  const idx = {};
-  header.forEach((h,i)=>idx[h]=i);
-  const records = [];
-  for(let i=1;i<rowsEl.length;i++){
-    const cells = getCells(rowsEl[i]);
-    if(!cells[idx['Segurado']]) continue;
+  if(!best) throw new Error('Não encontrei as colunas SEGURADO e PROPOSTA na Base Sis.');
+  const {aoa, r, hdr, iSeg, iProp} = best;
+  const iMod = findCol(hdr, ['modalidade']);
+  const iCor = findCol(hdr, ['corretor']);
+  const iOpe = findCol(hdr, ['operadora']);
+  let records = [];
+  for(let i=r+1; i<aoa.length; i++){
+    const row = aoa[i] || [];
+    const segurado = cellStr(row[iSeg]);
+    const proposta = cellStr(row[iProp]);
+    if(!segurado || !proposta) continue;
     records.push({
-      proposta: cells[idx['Proposta']] || '',
-      corretor: cells[idx['Corretor']] || '',
-      segurado: cells[idx['Segurado']] || '',
-      modalidade: cells[idx['Modalidade']] || '',
-      operadora: cells[idx['Operadora']] || ''
+      proposta, segurado,
+      modalidade: iMod!==-1 ? cellStr(row[iMod]) : '',
+      corretor:   iCor!==-1 ? cellStr(row[iCor]) : '',
+      operadora:  iOpe!==-1 ? cellStr(row[iOpe]) : ''
     });
   }
+  // Se a Base Sis tiver várias operadoras, cruza apenas com as propostas da Porto,
+  // para não trazer a proposta da mesma empresa em outra operadora.
+  const porto = records.filter(x=>/porto/i.test(x.operadora));
+  if(porto.length) records = porto;
+  if(records.length===0) throw new Error('Base Sis sem linhas com Segurado e Proposta preenchidos.');
   return records;
 }
 
@@ -406,8 +438,8 @@ document.getElementById('fileReport').addEventListener('change', async (e)=>{
 document.getElementById('fileBase').addEventListener('change', async (e)=>{
   const f = e.target.files[0];
   if(!f) return;
-  const text = await readFileAsText(f);
-  baseFile = {name:f.name, text};
+  const buffer = await f.arrayBuffer();
+  baseFile = {name:f.name, buffer};
   document.getElementById('baseFileList').innerHTML = `<div>✓ ${f.name}</div>`;
   checkReady();
 });
@@ -438,7 +470,7 @@ document.getElementById('btnProcess').addEventListener('click', ()=>{
 
 function runProcess(){
   try{
-    baseRecords = parseBaseSis(baseFile.text);
+    baseRecords = parseBaseSis(baseFile.buffer);
     buildIndexes();
 
     let rawRows = [];
@@ -781,6 +813,34 @@ function exportXLSX(){
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Importar');
   XLSX.writeFile(wb, `Layout_Porto_comissao.xlsx`);
+}
+
+function exportCSV(){
+  const rows = getExportRows();
+  if(rows.length===0){ alert('Não há linhas confirmadas para exportar.'); return; }
+  const esc = v => {
+    const s = String(v==null ? '' : v);
+    return /[";\r\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+  };
+  const header = ['Proposta', 'Nome', 'Modalidade', 'Parcela', 'Valor da Proposta', 'Porcentagem', 'Valor da Comissão'];
+  const lines = [header.map(esc).join(';')];
+  rows.forEach(r=>{
+    lines.push([
+      r.selected.proposta,
+      r.selected.segurado,
+      r.selected.modalidade,
+      r.parcela,
+      toBR(r.premioLiq),
+      toBR(r.taxa/100),
+      toBR(r.comissao)
+    ].map(esc).join(';'));
+  });
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], {type:'text/csv;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `Layout_Porto_comissao.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function exportTXT(){
