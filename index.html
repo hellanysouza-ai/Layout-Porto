@@ -831,7 +831,7 @@ function exportCSV(){
       r.selected.modalidade,
       r.parcela,
       toBR(r.premioLiq),
-      toBR(r.taxa/100),
+      toBR(r.taxa),   // CSV do Sis lê o número já em %: 2 → 2,0000%
       toBR(r.comissao)
     ].map(esc).join(';'));
   });
